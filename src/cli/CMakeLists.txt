@@ -1,6 +1,11 @@
 add_executable(dbccli
     main.cpp
+    Commands.cpp
+    Dbc.cpp
     export/CsvExporter.cpp
+    export/CsvSchemaExporter.cpp
+    export/JsonExporter.cpp
+    export/JsonSchemaExporter.cpp
 )
 target_link_libraries(dbccli PRIVATE dbc_core CLI11::CLI11)
 target_include_directories(dbccli PRIVATE ${CMAKE_SOURCE_DIR}/src)

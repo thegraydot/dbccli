@@ -2,12 +2,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
 namespace dbc {
 
-// Known version table - alpha (0.5.3–0.12.0) through WotLK 3.3.5a (≤ 12340)
+// Known version table - alpha (0.5.3-0.12.0) through WotLK 3.3.5a (<= 12340)
 // Build numbers sourced from WoWDBDefs build range data.
 static const KnownVersion KNOWN_VERSIONS[] = {
     // Pre-release Alpha (0.x)
@@ -178,9 +179,23 @@ std::optional<uint32_t> VersionTable::Resolve(const std::string& input) {
     }
 
     if (dots == 2) {
-        // "X.Y.Z" - look up in KNOWN_VERSIONS
+        // "X.Y.Z" - strip any trailing non-digit suffix from last component
+        // (e.g. "3.3.5a" -> "3.3.5") then look up in KNOWN_VERSIONS.
+        auto lastDot = work.rfind('.');
+        std::string lastComponent = work.substr(lastDot + 1);
+        std::string stripped = lastComponent;
+        while (!stripped.empty() && !std::isdigit(static_cast<unsigned char>(stripped.back()))) {
+            stripped.pop_back();
+        }
+        std::string normalised = work;
+        if (stripped != lastComponent) {
+            normalised = work.substr(0, lastDot + 1) + stripped;
+            std::cerr << "Warning: normalised version \"" << work
+                      << "\" to \"" << normalised << "\"\n";
+        }
+
         for (const auto& kv : KNOWN_VERSIONS) {
-            if (work == kv.versionString) {
+            if (normalised == kv.versionString) {
                 return kv.buildNumber;
             }
         }

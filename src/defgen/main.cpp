@@ -1,26 +1,23 @@
+#include "filter.h"
+#include "diagnostics.h"
+
 #include "../core/dbd/DbdParser.h"
-#include "../core/blob/BlobReader.h"   // for Fnv1a and BlobFormat constants
+#include "../core/blob/BlobReader.h"
 #include "../core/blob/BlobFormat.h"
 
+#include <CLI/CLI.hpp>
+
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
-#include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 using namespace dbc;
-
-static constexpr uint32_t MAX_BUILD = 12340u;
-
-// Helpers
 
 static std::string ToLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
@@ -28,94 +25,7 @@ static std::string ToLower(std::string s) {
     return s;
 }
 
-// Check if a VersionDefinition contains at least one build ≤ MAX_BUILD
-static bool VersionRelevant(const VersionDefinition& v) {
-    for (uint32_t b : v.builds) {
-        if (b <= MAX_BUILD) return true;
-    }
-    for (auto& [lo, hi] : v.buildRanges) {
-        if (lo <= MAX_BUILD) return true;
-    }
-    return false;
-}
-
-// Slice the raw DBD text to only include layout blocks that are relevant.
-// We do this by re-reading the file text and keeping only the lines that
-// belong to the COLUMNS section or to relevant VERSION blocks.
-static std::string FilterDbdText(const std::string& rawText,
-                                  const TableDefinition& parsed) {
-    // Walk the raw text line by line, collecting sections
-    std::istringstream ss(rawText);
-    std::string line;
-
-    std::string result;
-    result.reserve(rawText.size());
-
-    // State: are we in the COLUMNS block or in a version block?
-    bool     inColumns      = false;
-    bool     inVersionBlock = false;
-    bool     keepCurrent    = false;
-    int      versionIdx     = -1;
-
-    while (std::getline(ss, line)) {
-        std::string trimmed = line;
-        // Remove CR
-        if (!trimmed.empty() && trimmed.back() == '\r') trimmed.pop_back();
-        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
-            trimmed = trimmed.substr(1);
-
-        // Blank lines serve as version block terminators
-        if (trimmed.empty()) {
-            if (inVersionBlock && keepCurrent) result += "\n";
-            if (inVersionBlock) inVersionBlock = false;
-            continue;
-        }
-
-        if (trimmed == "COLUMNS") {
-            inColumns      = true;
-            inVersionBlock = false;
-            keepCurrent    = true;
-            result += line + "\n";
-            continue;
-        }
-
-        if (trimmed.rfind("LAYOUT", 0) == 0) {
-            inColumns      = false;
-            inVersionBlock = true;
-            ++versionIdx;
-            keepCurrent = (versionIdx < static_cast<int>(parsed.versions.size()) &&
-                           VersionRelevant(parsed.versions[static_cast<size_t>(versionIdx)]));
-            if (keepCurrent) result += line + "\n";
-            continue;
-        }
-
-        if (trimmed.rfind("BUILD", 0) == 0) {
-            if (!inVersionBlock) {
-                // Start a build-only version block
-                inColumns      = false;
-                inVersionBlock = true;
-                ++versionIdx;
-                keepCurrent = (versionIdx < static_cast<int>(parsed.versions.size()) &&
-                               VersionRelevant(parsed.versions[static_cast<size_t>(versionIdx)]));
-            }
-            if (keepCurrent) result += line + "\n";
-            continue;
-        }
-
-        if (inColumns) {
-            result += line + "\n";
-            continue;
-        }
-
-        if (inVersionBlock && keepCurrent) {
-            result += line + "\n";
-        }
-    }
-
-    return result;
-}
-
-// Write little-endian uint32 into a vector
+// Writes a uint32_t into a byte vector in little-endian order.
 static void PushU32(std::vector<uint8_t>& v, uint32_t val) {
     v.push_back(static_cast<uint8_t>(val >>  0));
     v.push_back(static_cast<uint8_t>(val >>  8));
@@ -123,39 +33,109 @@ static void PushU32(std::vector<uint8_t>& v, uint32_t val) {
     v.push_back(static_cast<uint8_t>(val >> 24));
 }
 
-// Main
-
 int main(int argc, char* argv[]) {
-    bool verbose = false;
-    bool debug   = false;
-    int  argStart = 1;
+    bool        verbose      = false;
+    bool        debug        = false;
+    bool        validate     = false;
+    bool        dumpFiltered = false;
+    std::string singleFile;
+    std::string defsArg;
+    std::string outArg;
 
-    while (argStart < argc && argv[argStart][0] == '-') {
-        std::string flag(argv[argStart]);
-        if (flag == "--verbose" || flag == "-v") verbose = true;
-        else if (flag == "--debug"   || flag == "-d") { verbose = true; debug = true; }
-        ++argStart;
+    CLI::App app{"defgen: generates a binary blob of filtered WoWDBDefs definitions"};
+    app.add_flag("-v,--verbose", verbose, "Print per-table and per-block diagnostics");
+    app.add_flag("-d,--debug",   debug,   "Print full field lists per block (implies --verbose)");
+    app.add_flag("--validate",   validate, "Run all checks without writing output");
+    app.add_flag("--dump-filtered", dumpFiltered,
+        "Print the filtered .dbd text to stdout (single-file mode only)");
+    app.add_option("-f,--file",  singleFile,
+        "Inspect a single .dbd file and print diagnostics; no output is written");
+
+    // Both positional arguments are optional at the CLI11 level so we can
+    // accept them being absent in --file and --validate modes.
+    app.add_option("definitions-dir", defsArg, "Directory containing .dbd definition files")
+        ->check(CLI::ExistingDirectory);
+    app.add_option("output-header", outArg, "Path to write the generated C++ header");
+
+    CLI11_PARSE(app, argc, argv);
+
+    // --debug implies --verbose
+    if (debug) verbose = true;
+
+    // Single-file mode: parse one .dbd, print diagnostics, then exit.
+    // No blob is built and no output file is written.
+    if (!singleFile.empty()) {
+        fs::path p(singleFile);
+        if (!fs::is_regular_file(p)) {
+            std::cerr << "Error: not a file: " << p << "\n";
+            return 1;
+        }
+
+        std::ifstream fs_in(p, std::ios::in);
+        if (!fs_in.is_open()) {
+            std::cerr << "Error: cannot open " << p << "\n";
+            return 1;
+        }
+
+        // Read the entire file into a string. The iterator-pair constructor
+        // streams all bytes from the file iterator into the string directly
+        // without needing to know the file size in advance.
+        std::string rawText((std::istreambuf_iterator<char>(fs_in)),
+                             std::istreambuf_iterator<char>());
+
+        DbdParser parser;
+        TableDefinition tbl;
+        try {
+            tbl = parser.ParseFile(p);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: parse failed: " << e.what() << "\n";
+            return 1;
+        }
+
+        CheckDuplicateBuilds(tbl);
+
+        int blocksKept = 0, blocksDropped = 0;
+        for (const auto& v : tbl.versions) {
+            if (VersionRelevant(v)) ++blocksKept;
+            else                    ++blocksDropped;
+        }
+
+        std::cerr << "[single-file] " << tbl.name
+                  << "  " << blocksKept << " block(s) kept";
+        if (blocksDropped > 0) std::cerr << ", " << blocksDropped << " dropped";
+        std::cerr << "\n";
+
+        // Always print at least verbose output in single-file mode so the
+        // mode is useful without requiring explicit flags.
+        PrintBlockInfo(tbl, /*verbose=*/true, debug);
+
+        // Emit the filtered .dbd text to stdout when requested, so the caller
+        // can diff it directly against the original source file.
+        if (dumpFiltered) {
+            std::cout << FilterDbdText(rawText, tbl);
+        }
+
+        return 0;
     }
 
-    if (argc - argStart != 2) {
-        std::cerr << "Usage: defgen [--verbose] [--debug] <definitions-dir> <output-header>\n";
+    // Directory-walk mode requires the definitions-dir positional.
+    if (defsArg.empty()) {
+        std::cerr << app.help();
+        return 1;
+    }
+    // Output path is only required when actually writing output.
+    if (!validate && outArg.empty()) {
+        std::cerr << "Error: output-header is required unless --validate is set\n";
         return 1;
     }
 
-    fs::path defsDir(argv[argStart]);
-    fs::path outPath(argv[argStart + 1]);
+    fs::path defsDir(defsArg);
+    fs::path outPath(outArg);
 
-    if (!fs::is_directory(defsDir)) {
-        std::cerr << "Error: not a directory: " << defsDir << "\n";
-        return 1;
-    }
-
-    // -----------------------------------------------------------------------
-    // Collect and filter all .dbd files
-    // -----------------------------------------------------------------------
+    // Holds the name and filtered text for each table that survives the filter.
     struct Entry {
-        std::string name;       // mixed-case table name
-        std::string filtered;   // filtered DBD text
+        std::string name;      // mixed-case table name (used as-is in the blob index)
+        std::string filtered;  // the filtered .dbd text that gets embedded
     };
 
     std::vector<Entry> entries;
@@ -168,12 +148,12 @@ int main(int argc, char* argv[]) {
 
         std::string tableName = dirEntry.path().stem().string();
 
-        // Read raw text
         std::ifstream fs_in(dirEntry.path(), std::ios::in);
         if (!fs_in.is_open()) {
             std::cerr << "Warning: cannot open " << dirEntry.path() << "\n";
             continue;
         }
+        // Read the entire file into a string (see note in single-file mode above).
         std::string rawText((std::istreambuf_iterator<char>(fs_in)),
                              std::istreambuf_iterator<char>());
 
@@ -186,7 +166,8 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Count relevant version blocks
+        CheckDuplicateBuilds(tbl);
+
         int blocksKept    = 0;
         int blocksDropped = 0;
         for (const auto& v : tbl.versions) {
@@ -196,14 +177,14 @@ int main(int argc, char* argv[]) {
 
         if (blocksKept == 0) {
             ++skipped;
-            if (verbose) {
-                std::cerr << "[skipped]  " << tableName << "\n";
-            }
+            if (verbose) std::cerr << "[skipped]  " << tableName << "\n";
             continue;
         }
 
-        // FilterDbdText uses the original (unfiltered) tbl so that versionIdx
-        // aligns with LAYOUT lines in the raw text.
+
+        // FilterDbdText uses the original parsed table so that the versionIdx
+        // counter inside the function lines up with LAYOUT/BUILD lines in the
+        // raw text. Passing a pre-filtered table would shift the indices.
         std::string filtered = FilterDbdText(rawText, tbl);
         entries.push_back({ tableName, std::move(filtered) });
 
@@ -216,53 +197,32 @@ int main(int argc, char* argv[]) {
             std::cerr << "\n";
         }
 
-        if (debug) {
-            for (size_t i = 0; i < tbl.versions.size(); ++i) {
-                const auto& v    = tbl.versions[i];
-                bool        kept = VersionRelevant(v);
-                std::cerr << "    block " << i << ": ";
-                if (!v.layoutHashes.empty()) {
-                    std::cerr << "LAYOUT";
-                    for (const auto& h : v.layoutHashes) std::cerr << " " << h;
-                    std::cerr << "  ";
-                }
-                if (!v.builds.empty()) {
-                    std::cerr << "builds=[";
-                    for (size_t j = 0; j < v.builds.size(); ++j) {
-                        if (j) std::cerr << ",";
-                        std::cerr << v.builds[j];
-                    }
-                    std::cerr << "]  ";
-                }
-                if (!v.buildRanges.empty()) {
-                    std::cerr << "ranges=[";
-                    for (size_t j = 0; j < v.buildRanges.size(); ++j) {
-                        if (j) std::cerr << ",";
-                        std::cerr << v.buildRanges[j].first << "-" << v.buildRanges[j].second;
-                    }
-                    std::cerr << "]  ";
-                }
-                std::cerr << (kept ? "-> kept" : "-> dropped") << "\n";
-            }
+        if (verbose || debug) {
+            PrintBlockInfo(tbl, verbose, debug);
         }
     }
 
-    // Sort entries by name for determinism
+    // In non-verbose mode, emit a one-line stderr summary so users know how
+    // many tables were excluded without having to dig into the stdout summary.
+    if (!verbose && skipped > 0) {
+        std::cerr << "defgen: " << skipped
+                  << " table(s) had no relevant blocks (use --verbose to list them)\n";
+    }
+
+    // Sort entries by name so the generated blob is deterministic regardless
+    // of the filesystem iteration order.
     std::sort(entries.begin(), entries.end(),
               [](const Entry& a, const Entry& b) { return a.name < b.name; });
 
-    // -----------------------------------------------------------------------
-    // FNV1a hash + collision detection
-    // -----------------------------------------------------------------------
-    std::vector<std::pair<uint32_t, std::string>> hashes;
-    hashes.reserve(entries.size());
-    for (const auto& e : entries) {
-        uint32_t h = Fnv1a(ToLower(e.name));
-        hashes.push_back({ h, e.name });
-    }
-
-    // Sort by hash and check adjacent pairs
-    std::vector<std::pair<uint32_t, std::string>> sortedHashes = hashes;
+    // FNV-1a hash collision check
+    //
+    // The blob index uses 32-bit FNV-1a hashes of the lowercase table name for
+    // O(log n) lookup. A collision between two table names would silently break
+    // lookups, so we verify here at generation time.
+    std::vector<std::pair<uint32_t, std::string>> sortedHashes;
+    sortedHashes.reserve(entries.size());
+    for (const auto& e : entries)
+        sortedHashes.push_back({ Fnv1a(ToLower(e.name)), e.name });
     std::sort(sortedHashes.begin(), sortedHashes.end());
     for (size_t i = 1; i < sortedHashes.size(); ++i) {
         if (sortedHashes[i].first == sortedHashes[i - 1].first) {
@@ -273,36 +233,44 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Build binary blob
-    // -----------------------------------------------------------------------
+    // In --validate mode all parsing and checks have now run. Exit without
+    // building the blob or writing any file.
     uint32_t tableCount = static_cast<uint32_t>(entries.size());
+    if (validate) {
+        std::cout << "defgen [validate]: " << tableCount << " tables OK, "
+                  << skipped << " skipped. No output written.\n";
+        return 0;
+    }
 
-    // Pre-compute data offsets
+    // Blob construction
+    //
+    // Binary layout:
+    //   Header  : magic(4) + version(4) + count(4) = 12 bytes
+    //   Index   : count * 44 bytes per entry
+    //             entry = hash(4) + name[32] + data_offset(4) + data_len(4)
+    //   Data    : all filtered .dbd texts concatenated, no separators
+    //
+    // At runtime BlobReader locates a table by binary-searching the index on
+    // the hash field, then reads data_len bytes starting at data_offset.
+
     std::vector<uint32_t> offsets(tableCount);
     uint32_t dataOffset = 0;
     for (uint32_t i = 0; i < tableCount; ++i) {
-        offsets[i] = dataOffset;
+        offsets[i]  = dataOffset;
         dataOffset += static_cast<uint32_t>(entries[i].filtered.size());
     }
 
-    // Header: magic(4) + version(4) + count(4) = 12 bytes
-    // Index : count * 44 bytes
-    // Data  : all filtered text concatenated
     std::vector<uint8_t> blob;
     blob.reserve(12 + tableCount * 44 + dataOffset);
 
-    // Header
     PushU32(blob, BDBC_MAGIC);
     PushU32(blob, BDBC_VERSION);
     PushU32(blob, tableCount);
 
-    // Index
     for (uint32_t i = 0; i < tableCount; ++i) {
-        uint32_t hash = Fnv1a(ToLower(entries[i].name));
-        PushU32(blob, hash);
+        PushU32(blob, Fnv1a(ToLower(entries[i].name)));
 
-        // 32-byte name field (null-terminated, max 31 characters)
+        // Name field: fixed 32-byte null-padded buffer, max 31 usable characters.
         char nameBuf[32]{};
         std::strncpy(nameBuf, entries[i].name.c_str(), 31);
         for (char c : nameBuf) blob.push_back(static_cast<uint8_t>(c));
@@ -311,16 +279,12 @@ int main(int argc, char* argv[]) {
         PushU32(blob, static_cast<uint32_t>(entries[i].filtered.size()));
     }
 
-    // Data section
     for (const auto& e : entries) {
         for (char c : e.filtered) blob.push_back(static_cast<uint8_t>(c));
     }
 
-    // -----------------------------------------------------------------------
     // Write header file
-    // -----------------------------------------------------------------------
 
-    // Create parent directories if needed
     if (outPath.has_parent_path()) {
         fs::create_directories(outPath.parent_path());
     }
@@ -343,7 +307,7 @@ int main(int argc, char* argv[]) {
     out << "    static constexpr uint32_t BDBC_DATA_SIZE    = " << blob.size() << "u;\n\n";
     out << "    static const uint8_t BDBC_DATA[] = {\n";
 
-    // Write bytes, 16 per line
+    // Write the blob as a hex byte array, 16 bytes per line.
     for (size_t i = 0; i < blob.size(); ++i) {
         if (i % 16 == 0) out << "        ";
         char hex[8];
@@ -363,3 +327,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+

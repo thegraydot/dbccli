@@ -103,8 +103,8 @@ bool WdbcReader::Validate(std::string& errorMessage) const {
             uint32_t remaining = _fieldCount - scalarSlots;
             if (remaining % locStrFields == 0) {
                 uint32_t candidate = remaining / locStrFields;
-                // Valid range: 8 (rare no-flags old format) through 17 (WotLK+)
-                if (candidate >= 8 && candidate <= 17) {
+                // Valid range: 1 (early alpha, few locale slots) through 17 (WotLK+)
+                if (candidate >= 1 && candidate <= 17) {
                     _locStringEntries = candidate;
                 }
             }
@@ -113,8 +113,37 @@ bool WdbcReader::Validate(std::string& errorMessage) const {
 
     uint32_t expected = ExpectedRecordSize();
     if (_recordSize != expected) {
+        // Per-field breakdown to aid diagnosis of mismatches
+        std::string breakdown;
+        uint32_t runningTotal = 0;
+        for (const auto& f : _def->fields) {
+            if (f.isNonInlineId) continue;
+            uint32_t fieldBytes;
+            if (f.isLocString) {
+                fieldBytes = _locStringEntries * 4;
+            } else {
+                fieldBytes = static_cast<uint32_t>(f.sizeBits / 8);
+            }
+            uint32_t contribution = fieldBytes * static_cast<uint32_t>(f.arrayCount);
+            runningTotal += contribution;
+
+            std::string typeTag = "<" + std::to_string(f.sizeBits) + ">";
+            if (f.isLocString) typeTag = "<locstring>";
+            else if (f.isFloat)  typeTag = "<float>";
+            else if (f.isString) typeTag = "<string>";
+
+            std::string line = "  " + f.name + typeTag;
+            if (f.arrayCount > 1) line += "[" + std::to_string(f.arrayCount) + "]";
+            line += "  " + std::to_string(contribution) +
+                    (contribution == 1 ? " byte" : " bytes");
+            breakdown += "\n" + line;
+        }
+        breakdown += "\n  [total: " + std::to_string(runningTotal) +
+                     " bytes, file reports " + std::to_string(_recordSize) + "]";
+
         errorMessage = "Record size mismatch: file has " + std::to_string(_recordSize) +
-                       " bytes/record, definition expects " + std::to_string(expected);
+                       " bytes/record, definition expects " + std::to_string(expected) +
+                       breakdown;
         return false;
     }
     return true;
@@ -163,7 +192,8 @@ std::optional<Record> WdbcReader::NextRecord() {
         fv.name = f.name;
 
         if (f.isNonInlineId) {
-            // Not present in record data; ID comes from cursor position
+            // $noninline,id$ does not appear in any build <= 12340; this branch
+            // is dead code for this tool's supported range.
             rec.id = _cursor;
             fv.value = std::to_string(_cursor);
             rec.fields.push_back(std::move(fv));

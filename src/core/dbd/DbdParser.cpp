@@ -77,9 +77,7 @@ TableDefinition DbdParser::Parse(std::istream& stream, const std::string& tableN
             continue;
         }
 
-        // ------------------------------------------------------------------
         // Section headers
-        // ------------------------------------------------------------------
         if (trimmed == "COLUMNS") {
             FlushVersion();
             section       = Section::Columns;
@@ -104,9 +102,16 @@ TableDefinition DbdParser::Parse(std::istream& stream, const std::string& tableN
         }
 
         if (trimmed.rfind("BUILD", 0) == 0) {
-            // A BUILD line can appear in any version block (with or without LAYOUT)
+            // A BUILD line can appear in any version block (with or without LAYOUT).
             if (!inVersionBlock) {
-                // Start a new build-only version block
+                // Start a new build-only version block.
+                section        = Section::Build;
+                inVersionBlock = true;
+                curVer         = VersionDefinition{};
+            } else if (!curVer.fields.empty()) {
+                // Fields already parsed into this block - missing blank-line separator.
+                // Implicitly flush and start a new version block (4a: parser hardening).
+                FlushVersion();
                 section        = Section::Build;
                 inVersionBlock = true;
                 curVer         = VersionDefinition{};
@@ -120,9 +125,7 @@ TableDefinition DbdParser::Parse(std::istream& stream, const std::string& tableN
             continue;
         }
 
-        // ------------------------------------------------------------------
         // Section bodies
-        // ------------------------------------------------------------------
         if (section == Section::Columns) {
             if (trimmed.front() == '/') continue;  // comment line
             ColumnDefinition col = ParseColumnLine(trimmed);

@@ -49,6 +49,9 @@ public:
     uint32_t RecordCount() const { return _recordCount; }
     uint32_t FieldCount()  const { return _fieldCount;  }
 
+    const VersionDefinition* Definition()    const { return _def; }
+    uint32_t                 LocStringEntries() const { return _locStringEntries; }
+
     // Field names in layout order (for CSV header)
     std::vector<std::string> FieldNames() const;
 
